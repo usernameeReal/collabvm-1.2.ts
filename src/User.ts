@@ -12,6 +12,7 @@ export class User {
     nopRecieveTimeout? : NodeJS.Timer;
     username? : string;
     connectedToNode : boolean;
+    viewMode : number;
     rank : Rank;
     msgsSent : number;
     Config : IConfig;
@@ -25,6 +26,7 @@ export class User {
     constructor(ws : WebSocket, ip : IPData, config : IConfig, username? : string, node? : string) {
         this.IP = ip;
         this.connectedToNode = false;
+        this.viewMode = -1;
         this.Config = config;
         this.socket = ws;
         this.msgsSent = 0;
@@ -43,7 +45,7 @@ export class User {
         this.rank = 0;
         this.ChatRateLimit = new RateLimiter(this.Config.collabvm.automute.messages, this.Config.collabvm.automute.seconds);
         this.ChatRateLimit.on('limit', () => this.mute(false));
-        this.RenameRateLimit = new RateLimiter(4, 3);
+        this.RenameRateLimit = new RateLimiter(3, 60);
         this.RenameRateLimit.on('limit', () => this.closeConnection());
         this.LoginRateLimit = new RateLimiter(4, 3);
         this.LoginRateLimit.on('limit', () => this.closeConnection());
@@ -117,4 +119,6 @@ export enum Rank {
     Unregistered = 0,
     Admin = 2,
     Moderator = 3,
+    // Giving a good gap between server only internal ranks just in case
+    Turn = 10,
 }

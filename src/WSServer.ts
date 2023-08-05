@@ -47,13 +47,13 @@ export default class WSServer {
     private ModPerms : number;  
     private VM : VM;
     constructor(config : IConfig, vm : VM) {
-        this.ChatHistory = new CircularBuffer<{user:string,msg:string}>(Array, 5);
+        this.Config = config;
+        this.ChatHistory = new CircularBuffer<{user:string,msg:string}>(Array, this.Config.collabvm.maxChatHistoryLength);
         this.TurnQueue = new Queue<User>();
         this.TurnTime = 0;
         this.TurnIntervalRunning = false;
         this.clients = [];
         this.ips = [];
-        this.Config = config;
         this.voteInProgress = false;
         this.voteTime = 0;
         this.voteCooldown = 0;
@@ -85,13 +85,35 @@ export default class WSServer {
             socket.write("HTTP/1.1 400 Bad Request\n\n400 Bad Request");
             socket.destroy();
         }
-        if (
-            req.headers['sec-websocket-protocol'] !== "guacamole" 
-            // || req.headers['origin']?.toLocaleLowerCase() !== "https://computernewb.com"
-        ) {
+
+        if (req.headers['sec-websocket-protocol'] !== "guacamole") {
             killConnection();
             return;
         }
+
+        if (this.Config.http.origin) {
+            // If the client is not sending an Origin header, kill the connection.
+            if(!req.headers.origin) {
+                killConnection();
+                return;
+            }
+
+            // Try to parse the Origin header sent by the client, if it fails, kill the connection.
+            var _host;
+            try {
+                _host = new URL(req.headers.origin.toLowerCase()).hostname;
+            } catch {
+                killConnection();
+                return;
+            }
+
+            // If the domain name is not in the list of allowed origins, kill the connection.
+            if(!this.Config.http.originAllowedDomains.includes(_host)) {
+                killConnection();
+                return;
+            }
+        }
+
         if (this.Config.http.proxying) {
             // If the requesting IP isn't allowed to proxy, kill it
             //@ts-ignore
@@ -200,8 +222,44 @@ export default class WSServer {
                 if (this.voteInProgress) this.sendVoteUpdate(client);
                 this.sendTurnUpdate(client);
                 break;
+            case "view":
+                if(client.connectedToNode) return;
+                if(client.username || msgArr.length !== 3 || msgArr[1] !== this.Config.collabvm.node) {
+                    // The use of connect here is intentional.
+                    client.sendMsg(guacutils.encode("connect", "0"));
+                    return;
+                }
+
+                switch(msgArr[2]) {
+                    case "0":
+                        client.viewMode = 0;
+                        break;
+                    case "1":
+                        client.viewMode = 1;
+                        break;
+                    default:
+                        client.sendMsg(guacutils.encode("connect", "0"));
+                        return;
+                }
+                
+                client.sendMsg(guacutils.encode("connect", "1", "1", this.Config.vm.snapshots ? "1" : "0", "0"));
+                if (this.ChatHistory.size !== 0) client.sendMsg(this.getChatHistoryMsg());
+                if (this.Config.collabvm.motd) client.sendMsg(guacutils.encode("chat", "", this.Config.collabvm.motd));
+                
+                if(client.viewMode == 1) {
+                    client.sendMsg(guacutils.encode("size", "0", this.VM.framebuffer.width.toString(), this.VM.framebuffer.height.toString()));
+                    var jpg = this.VM.framebuffer.toBuffer("image/jpeg");
+                    var jpg64 = jpg.toString("base64");
+                    client.sendMsg(guacutils.encode("png", "0", "0", "0", "0", jpg64));
+                    client.sendMsg(guacutils.encode("sync", Date.now().toString()));
+                }
+                
+                if (this.voteInProgress) this.sendVoteUpdate(client);
+                this.sendTurnUpdate(client);
+                break;
             case "rename":
                 if (!client.RenameRateLimit.request()) return;
+                if (client.connectedToNode && client.IP.muted) return;
                 this.renameUser(client, msgArr[1]);
                 break;
             case "chat":
@@ -211,14 +269,14 @@ export default class WSServer {
                 var msg = Utilities.HTMLSanitize(msgArr[1]);
                 // One of the things I hated most about the old server is it completely discarded your message if it was too long
                 if (msg.length > this.Config.collabvm.maxChatLength) msg = msg.substring(0, this.Config.collabvm.maxChatLength);
-                if (msg.length < 1) return;
+                if (msg.trim().length < 1) return;
                 //@ts-ignore
                 this.clients.forEach(c => c.sendMsg(guacutils.encode("chat", client.username, msg)));
                 this.ChatHistory.push({user: client.username, msg: msg});
                 client.onMsgSent();
                 break;
             case "turn":
-                if (!this.turnsAllowed && client.rank !== Rank.Admin && client.rank !== Rank.Moderator) return;
+                if ((!this.turnsAllowed || this.Config.collabvm.turnwhitelist) && client.rank !== Rank.Admin && client.rank !== Rank.Moderator && client.rank !== Rank.Turn) return;
                 if (!client.TurnRateLimit.request()) return;
                 if (!client.connectedToNode) return;
                 if (msgArr.length > 2) return;
@@ -239,11 +297,14 @@ export default class WSServer {
                         break;
                 }
                 if (takingTurn) {
+                    var currentQueue = this.TurnQueue.toArray();
                     // If the user is already in the queue, fuck them off
-                    if (this.TurnQueue.toArray().indexOf(client) !== -1) return;
+                    if (currentQueue.indexOf(client) !== -1) return;
                     // If they're muted, also fuck them off.
                     // Send them the turn queue to prevent client glitches
                     if (client.IP.muted) return;
+                    // Only allow one active turn per IP address
+                    if(currentQueue.find(user => user.IP.address == client.IP.address)) return;
                     this.TurnQueue.enqueue(client);
                     if (this.TurnQueue.size === 1) this.nextTurn();
                 } else {
@@ -272,7 +333,7 @@ export default class WSServer {
                 break;
             case "vote":
                 if (!this.Config.vm.snapshots) return;
-                if (!this.turnsAllowed) return;
+                if ((!this.turnsAllowed || this.Config.collabvm.turnwhitelist) && client.rank !== Rank.Admin && client.rank !== Rank.Moderator && client.rank !== Rank.Turn) return;
                 if (!client.connectedToNode) return;
                 if (msgArr.length !== 2) return;
                 if (!client.VoteRateLimit.request()) return;
@@ -316,6 +377,9 @@ export default class WSServer {
                         } else if (this.Config.collabvm.moderatorEnabled && pwdHash === this.Config.collabvm.modpass) {
                             client.rank = Rank.Moderator;
                             client.sendMsg(guacutils.encode("admin", "0", "3", this.ModPerms.toString()));
+                        } else if (this.Config.collabvm.turnwhitelist && pwdHash === this.Config.collabvm.turnpass) {
+                            client.rank = Rank.Turn;
+                            client.sendMsg(guacutils.encode("chat", "", "You may now take turns."));
                         } else {
                             client.sendMsg(guacutils.encode("admin", "0", "0"));
                             return;
@@ -488,9 +552,10 @@ export default class WSServer {
         if (!newName) {
             client.assignGuestName(this.getUsernameList());
         } else {
+            newName = newName.trim();
             if (hadName && newName === oldname) {
                 //@ts-ignore
-                client.sendMsg(guacutils.encode("rename", "0", "0", client.username));
+                client.sendMsg(guacutils.encode("rename", "0", "0", client.username, client.rank));
                 return;
             }
             if (this.getUsernameList().indexOf(newName) !== -1) {
@@ -509,12 +574,12 @@ export default class WSServer {
             } else client.username = newName;
         }
         //@ts-ignore
-        client.sendMsg(guacutils.encode("rename", "0", status, client.username));
+        client.sendMsg(guacutils.encode("rename", "0", status, client.username, client.rank));
         if (hadName) {
             log("INFO", `Rename ${client.IP.address} from ${oldname} to ${client.username}`);
-            this.clients.filter(c => c.username !== client.username).forEach((c) =>
+            this.clients.forEach((c) =>
             //@ts-ignore
-            c.sendMsg(guacutils.encode("rename", "1", oldname, client.username)));
+            c.sendMsg(guacutils.encode("rename", "1", oldname, client.username, client.rank)));
         } else {
             log("INFO", `Rename ${client.IP.address} to ${client.username}`);
             this.clients.forEach((c) =>
@@ -603,14 +668,14 @@ export default class WSServer {
     private async newrect(rect : Canvas, x : number, y : number) {
         var jpg = rect.toBuffer("image/jpeg", {quality: 0.5, progressive: true, chromaSubsampling: true});
         var jpg64 = jpg.toString("base64");
-        this.clients.filter(c => c.connectedToNode).forEach(c => {
+        this.clients.filter(c => c.connectedToNode || c.viewMode == 1).forEach(c => {
             c.sendMsg(guacutils.encode("png", "0", "0", x.toString(), y.toString(), jpg64));
             c.sendMsg(guacutils.encode("sync", Date.now().toString()));
         });
     }
 
     private newsize(size : {height:number,width:number}) {
-        this.clients.filter(c => c.connectedToNode).forEach(c => c.sendMsg(guacutils.encode("size", "0", size.width.toString(), size.height.toString())));
+        this.clients.filter(c => c.connectedToNode || c.viewMode == 1).forEach(c => c.sendMsg(guacutils.encode("size", "0", size.width.toString(), size.height.toString())));
     }
 
     getThumbnail() : Promise<string> {

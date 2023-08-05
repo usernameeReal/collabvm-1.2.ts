@@ -4,6 +4,8 @@ export default interface IConfig {
         port : number;
         proxying : boolean;
         proxyAllowedIps : string[];
+        origin : boolean;
+        originAllowedDomains : string[];
     };
     vm : {
         qemuArgs : string;
@@ -21,6 +23,7 @@ export default interface IConfig {
         moderatorEnabled : boolean;
         usernameblacklist : string[];
         maxChatLength : number;
+        maxChatHistoryLength : number;
         automute : {
             enabled: boolean;
             seconds: number;
@@ -32,6 +35,8 @@ export default interface IConfig {
         voteCooldown: number;
         adminpass : string;
         modpass : string;
+        turnwhitelist : boolean;
+        turnpass : string;
         moderatorPermissions : Permissions;
     };
 };
